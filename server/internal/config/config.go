@@ -1,7 +1,6 @@
 package config
 
 import (
-	"bufio"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -32,18 +31,19 @@ type VAPIDKeys struct {
 
 func Load() *Config {
 	cfg := &Config{
-		HTTPPort:     getEnv("HTTP_PORT", "80"),   // HTTP port for Let's Encrypt challenge
-		HTTPSPort:    getEnv("HTTPS_PORT", "443"), // HTTPS port
+		// По умолчанию работаем ТОЛЬКО по HTTP за Nginx
+		HTTPPort:     getEnv("HTTP_PORT", "5080"),
+		HTTPSPort:    getEnv("HTTPS_PORT", "0"), // TLS отключён
 		TURNPort:     getEnvInt("TURN_PORT", 3478),
 		TURNRealm:    getEnv("TURN_REALM", "familycall"),
 		DatabasePath: getEnv("DATABASE_PATH", "familycall.db"),
 		JWTSecret:    loadOrGenerateJWTSecret(),
 	}
 
-	// Load or prompt for domain
-	cfg.Domain = loadOrPromptDomain()
+	// Загружаем домен ТОЛЬКО неинтерактивно (ENV или файл). Без запросов в консоль.
+	cfg.Domain = loadDomainNonInteractive()
 
-	// Generate or load VAPID keys
+	// Генерируем или загружаем VAPID ключи
 	vapidKeys := loadVAPIDKeys()
 	cfg.VAPIDKeys = vapidKeys
 
@@ -68,20 +68,19 @@ func getEnvInt(key string, defaultValue int) int {
 
 func generateRandomSecret() string {
 	bytes := make([]byte, 32)
-	rand.Read(bytes)
+	_, _ = rand.Read(bytes)
 	return base64.URLEncoding.EncodeToString(bytes)
 }
 
 func loadOrGenerateJWTSecret() string {
-	// Try environment variable first (highest priority)
+	// 1) ENV приоритетнее всего
 	if secret := os.Getenv("JWT_SECRET"); secret != "" {
 		return secret
 	}
 
-	// Try to load from keys directory
+	// 2) Файл на диске (рядом с бинарём, в подкаталоге keys)
 	keysDir := getKeysDirectory()
 	secretFile := filepath.Join(keysDir, "jwt-secret.key")
-
 	if secretData, err := os.ReadFile(secretFile); err == nil {
 		secret := strings.TrimSpace(string(secretData))
 		if secret != "" {
@@ -90,10 +89,8 @@ func loadOrGenerateJWTSecret() string {
 		}
 	}
 
-	// Generate new secret
+	// 3) Генерация нового секрета и сохранение
 	secret := generateRandomSecret()
-
-	// Save secret to file
 	if err := os.MkdirAll(keysDir, 0700); err == nil {
 		if err := os.WriteFile(secretFile, []byte(secret), 0600); err == nil {
 			fmt.Printf("JWT secret saved to: %s\n", secretFile)
@@ -102,16 +99,14 @@ func loadOrGenerateJWTSecret() string {
 			fmt.Println("Secret will be regenerated on next restart unless set via JWT_SECRET environment variable")
 		}
 	}
-
 	return secret
 }
 
 func loadVAPIDKeys() *VAPIDKeys {
-	// Try to load from environment first (highest priority)
+	// 1) ENV
 	publicKey := os.Getenv("VAPID_PUBLIC_KEY")
 	privateKey := os.Getenv("VAPID_PRIVATE_KEY")
 	subject := os.Getenv("VAPID_SUBJECT")
-
 	if publicKey != "" && privateKey != "" {
 		return &VAPIDKeys{
 			PublicKey:  publicKey,
@@ -120,7 +115,7 @@ func loadVAPIDKeys() *VAPIDKeys {
 		}
 	}
 
-	// Try to load from keys directory
+	// 2) Файлы на диске
 	keysDir := getKeysDirectory()
 	publicKeyFile := filepath.Join(keysDir, "vapid-public.key")
 	privateKeyFile := filepath.Join(keysDir, "vapid-private.key")
@@ -130,95 +125,84 @@ func loadVAPIDKeys() *VAPIDKeys {
 		if privateKeyData, err := os.ReadFile(privateKeyFile); err == nil {
 			publicKey = string(publicKeyData)
 			privateKey = string(privateKeyData)
-			
-			// Check if private key is in old PKCS#8 format (should be ~138 bytes when decoded)
-			// New format should be 32 bytes (raw private key)
+
+			// Проверяем формат приватного ключа
 			decodedPrivate, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(privateKey))
 			if err == nil {
 				if len(decodedPrivate) > 50 {
-					// Old PKCS#8 format detected - need to convert or regenerate
-					fmt.Printf("WARNING: VAPID private key is in old PKCS#8 format (%d bytes). ", len(decodedPrivate))
-					fmt.Printf("Deleting old keys to regenerate in correct format...\n")
-					os.Remove(publicKeyFile)
-					os.Remove(privateKeyFile)
-					os.Remove(subjectFile)
-					// Fall through to generate new keys
+					// Старый PKCS#8 — удаляем и регенерируем
+					fmt.Printf("WARNING: VAPID private key is in old PKCS#8 format (%d bytes). Deleting old keys to regenerate...\n", len(decodedPrivate))
+					_ = os.Remove(publicKeyFile)
+					_ = os.Remove(privateKeyFile)
+					_ = os.Remove(subjectFile)
+					// перейдём к генерации ниже
 				} else if len(decodedPrivate) == 32 {
-					// Valid raw format
+					// Валидный raw формат
 					if subjectData, err := os.ReadFile(subjectFile); err == nil {
 						subject = string(subjectData)
 					} else {
 						subject = getEnv("VAPID_SUBJECT", "mailto:admin@familycall.app")
 					}
-
 					return &VAPIDKeys{
 						PublicKey:  publicKey,
 						PrivateKey: privateKey,
 						Subject:    subject,
 					}
 				} else {
-					fmt.Printf("WARNING: VAPID private key has unexpected length (%d bytes). ", len(decodedPrivate))
-					fmt.Printf("Deleting to regenerate...\n")
-					os.Remove(publicKeyFile)
-					os.Remove(privateKeyFile)
-					os.Remove(subjectFile)
-					// Fall through to generate new keys
+					fmt.Printf("WARNING: VAPID private key has unexpected length (%d bytes). Deleting to regenerate...\n", len(decodedPrivate))
+					_ = os.Remove(publicKeyFile)
+					_ = os.Remove(privateKeyFile)
+					_ = os.Remove(subjectFile)
+					// перейдём к генерации ниже
 				}
 			} else {
-				// Can't decode - might be corrupted, regenerate
+				// Не декодируется — регенерируем
 				fmt.Printf("WARNING: Cannot decode VAPID private key. Regenerating...\n")
-				os.Remove(publicKeyFile)
-				os.Remove(privateKeyFile)
-				os.Remove(subjectFile)
-				// Fall through to generate new keys
+				_ = os.Remove(publicKeyFile)
+				_ = os.Remove(privateKeyFile)
+				_ = os.Remove(subjectFile)
+				// перейдём к генерации ниже
 			}
 		}
 	}
 
-	// Generate new VAPID keys
+	// 3) Генерация новых VAPID ключей
 	privateKeyECDSA, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		panic("Failed to generate VAPID keys: " + err.Error())
 	}
 
-	// Generate uncompressed public key (65 bytes: 0x04 + 32 bytes X + 32 bytes Y)
+	// Публичный ключ (нежатая точка: 0x04 + X(32) + Y(32))
 	publicKeyBytes := make([]byte, 65)
-	publicKeyBytes[0] = 0x04 // Uncompressed point prefix
+	publicKeyBytes[0] = 0x04
 	privateKeyECDSA.PublicKey.X.FillBytes(publicKeyBytes[1:33])
 	privateKeyECDSA.PublicKey.Y.FillBytes(publicKeyBytes[33:65])
-
-	// Encode uncompressed public key to base64 URL-safe (no padding) for browser
 	uncompressedPublicKey := base64.RawURLEncoding.EncodeToString(publicKeyBytes)
 
-	// Extract raw private key bytes (32 bytes for P-256 curve)
-	// The webpush library expects raw private key bytes, NOT PKCS#8 format
+	// Приватный ключ (сырые 32 байта)
 	privateKeyBytes := make([]byte, 32)
 	privateKeyECDSA.D.FillBytes(privateKeyBytes)
-	
-	// Encode raw private key bytes to base64 URL-safe (no padding) for webpush library
-	// This matches the format returned by webpush.GenerateVAPIDKeys()
 	privateKeyBase64 := base64.RawURLEncoding.EncodeToString(privateKeyBytes)
 
 	subject = getEnv("VAPID_SUBJECT", "mailto:admin@familycall.app")
 
-	// Save keys to files
+	// Сохраняем
 	if err := saveVAPIDKeys(keysDir, uncompressedPublicKey, privateKeyBase64, subject); err != nil {
 		fmt.Printf("Warning: Failed to save VAPID keys to disk: %v\n", err)
 		fmt.Println("Keys will be regenerated on next restart unless set via environment variables")
 	}
 
 	return &VAPIDKeys{
-		PublicKey:  uncompressedPublicKey, // Uncompressed 65-byte key for browser
-		PrivateKey: privateKeyBase64,      // Raw 32-byte private key for webpush library
+		PublicKey:  uncompressedPublicKey,
+		PrivateKey: privateKeyBase64,
 		Subject:    subject,
 	}
 }
 
 func getKeysDirectory() string {
-	// Get directory where the executable is located
+	// Каталог рядом с бинарём
 	execPath, err := os.Executable()
 	if err != nil {
-		// Fallback to current directory
 		return "keys"
 	}
 	execDir := filepath.Dir(execPath)
@@ -226,24 +210,20 @@ func getKeysDirectory() string {
 }
 
 func saveVAPIDKeys(keysDir, publicKey, privateKey, subject string) error {
-	// Create keys directory if it doesn't exist
 	if err := os.MkdirAll(keysDir, 0700); err != nil {
 		return fmt.Errorf("failed to create keys directory: %w", err)
 	}
 
-	// Save public key
 	publicKeyFile := filepath.Join(keysDir, "vapid-public.key")
 	if err := os.WriteFile(publicKeyFile, []byte(publicKey), 0600); err != nil {
 		return fmt.Errorf("failed to save public key: %w", err)
 	}
 
-	// Save private key
 	privateKeyFile := filepath.Join(keysDir, "vapid-private.key")
 	if err := os.WriteFile(privateKeyFile, []byte(privateKey), 0600); err != nil {
 		return fmt.Errorf("failed to save private key: %w", err)
 	}
 
-	// Save subject
 	subjectFile := filepath.Join(keysDir, "vapid-subject.key")
 	if err := os.WriteFile(subjectFile, []byte(subject), 0600); err != nil {
 		return fmt.Errorf("failed to save subject: %w", err)
@@ -254,23 +234,23 @@ func saveVAPIDKeys(keysDir, publicKey, privateKey, subject string) error {
 }
 
 func getCertsDirectory() string {
-	// Get directory where the executable is located
+	// Каталог рядом с бинарём
 	execPath, err := os.Executable()
 	if err != nil {
-		// Fallback to current directory
 		return "certs"
 	}
 	execDir := filepath.Dir(execPath)
 	return filepath.Join(execDir, "certs")
 }
 
-func loadOrPromptDomain() string {
-	// Try environment variable first
+// НЕИНТЕРАКТИВНАЯ загрузка домена: только ENV или файл. Без запросов в консоль.
+func loadDomainNonInteractive() string {
+	// 1) ENV
 	if domain := os.Getenv("DOMAIN"); domain != "" {
-		return domain
+		return strings.TrimSpace(domain)
 	}
 
-	// Try to load from certs directory
+	// 2) Файл рядом с бинарём
 	certsDir := getCertsDirectory()
 	domainFile := filepath.Join(certsDir, "domain.txt")
 	if domainData, err := os.ReadFile(domainFile); err == nil {
@@ -280,43 +260,6 @@ func loadOrPromptDomain() string {
 		}
 	}
 
-	// Prompt for domain
-	fmt.Println("\n=== Domain Configuration ===")
-	fmt.Println("No domain configured. Please enter your domain name for Let's Encrypt SSL certificate.")
-	fmt.Println("Example: example.com or subdomain.example.com")
-	fmt.Println("Note: For Let's Encrypt to work, your domain must point to this server's IP address.")
-	fmt.Println("      Ports 80 and 443 must be open and accessible from the internet.")
-	fmt.Print("Domain (or 'localhost' for development): ")
-
-	reader := bufio.NewReader(os.Stdin)
-	domain, err := reader.ReadString('\n')
-	if err != nil {
-		fmt.Printf("Error reading domain: %v\n", err)
-		fmt.Println("Using default: localhost (Let's Encrypt will not work, use self-signed certs)")
-		return "localhost"
-	}
-
-	domain = strings.TrimSpace(domain)
-	if domain == "" {
-		fmt.Println("Domain cannot be empty. Using default: localhost")
-		return "localhost"
-	}
-
-	// Warn if using localhost
-	if domain == "localhost" || domain == "127.0.0.1" {
-		fmt.Println("Warning: Using localhost. Let's Encrypt will not work.")
-		fmt.Println("         The server will attempt to get certificates but will fail.")
-		fmt.Println("         For production, use a real domain name.")
-	}
-
-	// Save domain to file
-	if err := os.MkdirAll(certsDir, 0700); err == nil {
-		domainFile := filepath.Join(certsDir, "domain.txt")
-		if err := os.WriteFile(domainFile, []byte(domain), 0600); err == nil {
-			fmt.Printf("Domain saved to: %s\n", domainFile)
-		}
-	}
-
-	return domain
+	// 3) Ничего не нашли — возвращаем пустую строку (main прошьёт нужное значение)
+	return ""
 }
-
