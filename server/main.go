@@ -104,13 +104,12 @@ func setupRouter(h *handlers.Handlers, cfg *config.Config, basePath string) *gin
 	if os.Getenv("GIN_MODE") == "" {
 		gin.SetMode(gin.ReleaseMode)
 	}
-
 	router := gin.Default()
 
 	// Если сервер работает за Nginx, можно доверять прокси (по умолчанию nil = все)
 	_ = router.SetTrustedProxies(nil)
 
-	// Middleware: срезаем BasePath на входе
+	// Middleware: срезаем BasePath на входе (оставляем как было)
 	if basePath != "" && basePath != "/" {
 		router.Use(func(c *gin.Context) {
 			if strings.HasPrefix(c.Request.URL.Path, basePath) {
@@ -136,7 +135,7 @@ func setupRouter(h *handlers.Handlers, cfg *config.Config, basePath string) *gin
 		c.Next()
 	})
 
-	// Public routes
+	// Public routes (без префикса)
 	api := router.Group("/api")
 	{
 		api.POST("/register", h.Register)
@@ -148,7 +147,7 @@ func setupRouter(h *handlers.Handlers, cfg *config.Config, basePath string) *gin
 		api.GET("/translations/:lang", h.GetTranslations)
 	}
 
-	// Protected routes
+	// Protected routes (без префикса)
 	protected := api.Group("")
 	protected.Use(h.AuthMiddleware())
 	{
@@ -169,8 +168,43 @@ func setupRouter(h *handlers.Handlers, cfg *config.Config, basePath string) *gin
 		protected.POST("/restore", h.Restore)
 	}
 
-	// WebSocket route
+	// ДОБАВЛЕНО: Public routes под BasePath (дубли)
+	apiBP := router.Group(basePath + "/api")
+	{
+		apiBP.POST("/register", h.Register)
+		apiBP.POST("/login", h.Login)
+		apiBP.GET("/registration-status", h.CheckRegistrationStatus)
+		apiBP.GET("/invite/:uuid", h.GetInvite)
+		apiBP.GET("/vapid-public-key", h.GetVAPIDPublicKey)
+		apiBP.GET("/turn-config", h.GetTURNConfig)
+		apiBP.GET("/translations/:lang", h.GetTranslations)
+	}
+
+	// ДОБАВЛЕНО: Protected routes под BasePath (дубли)
+	protectedBP := apiBP.Group("")
+	protectedBP.Use(h.AuthMiddleware())
+	{
+		protectedBP.GET("/me", h.GetMe)
+		protectedBP.POST("/users/rename", h.RenameUser)
+		protectedBP.GET("/contacts", h.GetContacts)
+		protectedBP.POST("/contacts", h.CreateContact)
+		protectedBP.DELETE("/contacts/:id", h.DeleteContact)
+		protectedBP.GET("/contacts/:contact_id/invite", h.GetInviteForContact)
+		protectedBP.GET("/invites/pending", h.GetPendingInvites)
+		protectedBP.DELETE("/invites/:id", h.DeleteInvite)
+		protectedBP.POST("/invite", h.CreateInvite)
+		protectedBP.POST("/invite/:uuid/accept", h.AcceptInvite)
+		protectedBP.POST("/call", h.InitiateCall)
+		protectedBP.POST("/push/subscribe", h.SubscribePush)
+		protectedBP.DELETE("/push/subscribe", h.UnsubscribePush)
+		protectedBP.GET("/backup", h.Backup)
+		protectedBP.POST("/restore", h.Restore)
+	}
+
+	// WebSocket routes
 	router.GET("/ws", h.HandleWebSocket)
+	// ДОБАВЛЕНО: дубль для BasePath
+	router.GET(basePath+"/ws", h.HandleWebSocket)
 
 	// Manifest.json route (ensure correct content-type)
 	router.GET("/manifest.json", func(c *gin.Context) {
@@ -206,7 +240,6 @@ func setupRouter(h *handlers.Handlers, cfg *config.Config, basePath string) *gin
 		swStr := string(swContent)
 		cacheName := fmt.Sprintf("familycall-v3-%d", buildTimestamp)
 		swStr = strings.ReplaceAll(swStr, `const CACHE_NAME = 'familycall-v3';`, fmt.Sprintf(`const CACHE_NAME = '%s';`, cacheName))
-
 		c.Header("Content-Type", "application/javascript; charset=utf-8")
 		c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
 		c.String(http.StatusOK, swStr)
